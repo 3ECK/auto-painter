@@ -19,13 +19,8 @@ let paintLoopId = null;
 const TILE_SIZE = 1000; // From TemplateManager
 const DEBUG_MODE = false; // Set to TRUE to log payloads without sending requests
 
-async function startAutoPaint(overlayInstance) {
-  if (isPainting) {
-    isPainting = false;
-    overlayInstance.handleDisplayStatus("Painting Stopped.");
-    overlayInstance.updateInnerHTML('bm-button-autodraw', 'Start Painting');
-    return;
-  }
+async function handlePaintClick(overlayInstance) {
+  if (isPainting) return;
 
   // Init WASM
   const wasmReady = await initWasm();
@@ -35,10 +30,16 @@ async function startAutoPaint(overlayInstance) {
   }
 
   isPainting = true;
-  overlayInstance.handleDisplayStatus("Painting Started...");
-  overlayInstance.updateInnerHTML('bm-button-autodraw', 'Stop Painting');
+  overlayInstance.updateInnerHTML('bm-button-autodraw', 'Painting...');
+  overlayInstance.handleDisplayStatus("Preparing batch...");
 
-  paintLoop(overlayInstance);
+  try {
+    await executeSinglePaint(overlayInstance);
+  } finally {
+    isPainting = false;
+    overlayInstance.updateInnerHTML('bm-button-autodraw', 'Paint');
+    // message might be overwritten by executeSinglePaint, but this ensures reset state
+  }
 }
 
 // Cached user info for paint loop
@@ -85,23 +86,48 @@ async function fetchUserInfo(overlayInstance) {
 }
 
 // 4b. Modified paintLoop (uses cachedCharges, no fetch per loop)
-async function paintLoop(overlayInstance) {
-  if (!isPainting) return;
-
+// 4b. Single Paint Execution (uses cachedCharges)
+async function executeSinglePaint(overlayInstance) {
   // Use cached charges (updated on init and after each paint response)
   const sliderVal = Number(document.querySelector('#bm-input-charges-limit')?.value || 30);
 
   if (cachedCharges < 1) {
-    overlayInstance.handleDisplayStatus("No charges! Waiting...");
-    paintLoopId = setTimeout(() => paintLoop(overlayInstance), 5000);
+    overlayInstance.handleDisplayStatus("No charges!");
     return;
   }
 
   // 2. Get Candidates
-  const candidates = templateManager.getAllWrongPixels();
+  // 2. Get Candidates
+  let candidates = templateManager.getAllWrongPixels();
   if (candidates.length === 0) {
-    overlayInstance.handleDisplayStatus("No wrong pixels found. Waiting...");
-    paintLoopId = setTimeout(() => paintLoop(overlayInstance), 2000);
+    overlayInstance.handleDisplayStatus("No wrong pixels found.");
+    return;
+  }
+
+  // Filter candidates by Enabled status immediately
+  const t = templateManager.templatesArray?.[0];
+  if (t && t.colorPalette) {
+    candidates = candidates.filter(p => {
+      const rgbKey = `${p.color[0]},${p.color[1]},${p.color[2]}`;
+
+      // #DEFACE = RGB(222, 250, 206), treated as transparent
+      const isTransparent = (p.color[3] === 0) || (rgbKey === '222,250,206');
+
+      if (isTransparent) {
+        return t.colorPalette['#deface']?.enabled !== false;
+      } else {
+        let paletteKey = rgbKey;
+        // Fallback to 'other' if specific color not found in palette
+        if (!t.colorPalette[paletteKey] && t.colorPalette['other']) {
+          paletteKey = 'other';
+        }
+        return t.colorPalette[paletteKey]?.enabled !== false;
+      }
+    });
+  }
+
+  if (candidates.length === 0) {
+    overlayInstance.handleDisplayStatus("No enabled pixels found in candidate list.");
     return;
   }
 
@@ -125,7 +151,10 @@ async function paintLoop(overlayInstance) {
 
   // 4. Select a Batch
   const targetTileKey = batchByTile.keys().next().value;
-  if (!targetTileKey) return;
+  if (!targetTileKey) {
+    overlayInstance.handleDisplayStatus("No valid batch.");
+    return;
+  }
 
   const pixelsToPaint = batchByTile.get(targetTileKey);
   const [tileX, tileY] = targetTileKey.split(',').map(Number);
@@ -133,13 +162,14 @@ async function paintLoop(overlayInstance) {
   // 5. Prepare Payload
   const colors = [];
   const coords = [];
-  const t = templateManager.templatesArray?.[0];
+  // const t = templateManager.templatesArray?.[0]; // Already defined above
 
   if (!t || !t.rgbToMeta) {
     overlayInstance.handleDisplayError("Template metadata missing!");
-    isPainting = false;
     return;
   }
+
+  let droppedMeta = 0;
 
   for (const p of pixelsToPaint) {
     const rgbKey = `${p.color[0]},${p.color[1]},${p.color[2]}`;
@@ -154,6 +184,7 @@ async function paintLoop(overlayInstance) {
       const relY = Math.floor(p.y % TILE_SIZE);
       coords.push(relX, relY);
       continue; // Skip to next pixel, don't look up meta
+
     }
 
     const meta = t.rgbToMeta.get(rgbKey);
@@ -162,12 +193,14 @@ async function paintLoop(overlayInstance) {
       const relX = Math.floor(p.x % TILE_SIZE);
       const relY = Math.floor(p.y % TILE_SIZE);
       coords.push(relX, relY);
+    } else {
+      droppedMeta++;
+      if (droppedMeta === 1) console.log(`[BM DEBUG] First dropped meta: ${rgbKey}. Palette has it? ${!!t.colorPalette[rgbKey]}`);
     }
   }
 
   if (colors.length === 0) {
-    overlayInstance.handleDisplayStatus("Batch failed: No valid colors.");
-    paintLoopId = setTimeout(() => paintLoop(overlayInstance), 2000);
+    overlayInstance.handleDisplayStatus(`Batch failed: No valid colors. (MetaFail: ${droppedMeta})`);
     return;
   }
 
@@ -175,8 +208,7 @@ async function paintLoop(overlayInstance) {
   const effectiveBatchSize = Math.min(colors.length, sliderVal);
 
   if (effectiveBatchSize <= 0) {
-    overlayInstance.handleDisplayStatus("Waiting for charges...");
-    paintLoopId = setTimeout(() => paintLoop(overlayInstance), 3000);
+    overlayInstance.handleDisplayStatus("Batch size 0.");
     return;
   }
 
@@ -197,7 +229,6 @@ async function paintLoop(overlayInstance) {
   if (DEBUG_MODE) {
     // ... debug code ...
     console.log("Debug Paint", payload);
-    paintLoopId = setTimeout(() => paintLoop(overlayInstance), 2000);
     return;
   }
 
@@ -216,12 +247,16 @@ async function paintLoop(overlayInstance) {
     });
     templateManager.wrongPixelsMap.set(targetTileKey, newWrong);
 
-    const cooldown = json.cooldown || 2000;
-    paintLoopId = setTimeout(() => paintLoop(overlayInstance), Math.max(cooldown, 500));
+    // Check result
+    if (json.success === false) {
+      overlayInstance.handleDisplayStatus(`Paint Failed: ${json.error || 'Unknown'}`);
+    } else {
+      overlayInstance.handleDisplayStatus(`Painted ${effectiveBatchSize} pixels successfully!`);
+      await fetchUserInfo(overlayInstance);
+    }
 
   } catch (e) {
     overlayInstance.handleDisplayError(`Paint Error: ${e.message}`);
-    paintLoopId = setTimeout(() => paintLoop(overlayInstance), 5000);
   }
 }
 
@@ -713,11 +748,14 @@ function buildOverlayMain() {
     }).buildElement()
     .addSmall({ 'id': 'bm-charges-limit-val', 'textContent': (GM_getValue('bmMaxCharges', 30)), 'style': 'min-width: 25px; text-align: right;' }).buildElement()
     .buildElement()
-    .addInput({ 'type': 'text', 'id': 'bm-input-fp', 'placeholder': 'Fingerprint (fp)', 'style': 'width: 100%; margin-bottom: 5px; font-size: 10px;', 'value': (GM_getValue('bmFingerprint', 'a0529c6623486c6946452301dd40f943')) }, (instance, input) => {
+    .addDiv({ 'style': 'display: flex; align-items: center; gap: 5px; margin-bottom: 5px;' })
+    .addSmall({ 'textContent': 'FP:', 'style': 'color: gray; white-space: nowrap;' }).buildElement()
+    .addInput({ 'type': 'text', 'id': 'bm-input-fp', 'placeholder': 'Fingerprint', 'style': 'width: 100%; font-size: 11px; background: #222; color: #fff; border: 1px solid #444; padding: 2px 4px; border-radius: 3px;', 'value': (GM_getValue('bmFingerprint', 'a0529c6623486c6946452301dd40f943')) }, (instance, input) => {
       input.addEventListener('input', () => {
         GM.setValue('bmFingerprint', input.value.trim());
       });
     }).buildElement()
+    .buildElement()
     .addDiv({ 'id': 'bm-contain-coords' })
     .addButton({ 'id': 'bm-button-coords', 'className': 'bm-help', 'style': 'margin-top: 0;', 'innerHTML': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 6"><circle cx="2" cy="2" r="2"></circle><path d="M2 6 L3.7 3 L0.3 3 Z"></path><circle cx="2" cy="2" r="0.7" fill="white"></circle></svg></svg>' },
       (instance, button) => {
@@ -844,9 +882,9 @@ function buildOverlayMain() {
     // .addButton({'id': 'bm-button-favorite', 'className': 'bm-help', 'innerHTML': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><polygon points="10,2 12,7.5 18,7.5 13.5,11.5 15.5,18 10,14 4.5,18 6.5,11.5 2,7.5 8,7.5" fill="white"></polygon></svg>'}).buildElement()
     // .addButton({'id': 'bm-button-templates', 'className': 'bm-help', 'innerHTML': '🖌'}).buildElement()
 
-    .addButton({ 'id': 'bm-button-autodraw', 'className': 'btn', 'style': 'width: 100%; margin: 5px 0; background-color: #4CAF50; color: white; padding: 5px;', 'textContent': 'Start Painting' }, (instance, button) => {
+    .addButton({ 'id': 'bm-button-autodraw', 'className': 'btn', 'style': 'width: 80%; margin: 5px auto; display: block; background-color: #4CAF50; color: white; padding: 8px; font-size: 13px;', 'textContent': 'Paint' }, (instance, button) => {
       button.onclick = () => {
-        startAutoPaint(instance);
+        handlePaintClick(instance);
       };
     }).buildElement()
     .buildElement()

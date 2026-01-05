@@ -22,7 +22,7 @@ formatted_order = [
 HEADER = """// ==UserScript==
 // @name         BM Auto-Painter
 // @namespace    https://wplace.live/
-// @version      2.0.2
+// @version      2.3.0
 // @description  Automated pixel painting with WASM token generation.
 // @author       SwingTheVine & Refactored by 3eck
 // @match        https://wplace.live/*
